@@ -1,0 +1,89 @@
+name: makcha
+
+# 막차편(makcha.factpane.com)의 매일 수집·빌드·배포. 공개 저장소 andonghun/bus-runner에서 돈다.
+# 하루 30분 남짓 쓰는 막차편 수집도 비공개 sites 저장소의 Actions 무료분(월 2,000분)에서 뺐다.
+# 코드는 매 실행마다 비공개 andonghun/sites의 main을 읽기 전용 배포 키로 받아 온다. 이 파일의 원본은 sites의 ops/bus-runner/에 있다.
+
+on:
+  schedule:
+    - cron: '0 18 * * *' # 03:00 KST
+  workflow_dispatch:
+
+concurrency:
+  group: makcha
+  cancel-in-progress: false
+
+env:
+  INDEXNOW_KEY: ${{ secrets.INDEXNOW_KEY }}
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    defaults:
+      run:
+        working-directory: sites/makcha
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: andonghun/sites
+          ref: main
+          ssh-key: ${{ secrets.SITES_DEPLOY_KEY }}
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+        working-directory: .
+
+      # 캐시가 없으면(첫 실행, 7일 미사용) 이 저장소 릴리스 seed의 사본으로 시작한다.
+      - name: Restore data
+        id: restore
+        uses: actions/cache/restore@v4
+        with:
+          path: sites/makcha/data
+          key: makcha-data-${{ github.run_id }}
+          restore-keys: makcha-data-
+
+      - name: Seed data
+        if: steps.restore.outputs.cache-matched-key == ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release download seed -R "$GITHUB_REPOSITORY" -p makcha-data.tar.gz -D "$RUNNER_TEMP"
+          tar -xzf "$RUNNER_TEMP/makcha-data.tar.gz" -C "$GITHUB_WORKSPACE"
+          ls -la data
+
+      - name: Collect
+        run: pnpm collect
+        env:
+          DATA_GO_KR_KEY: ${{ secrets.TAGO_API_KEY }}
+          MAKCHA_DAILY_BUDGET: '9000'
+
+      - run: pnpm build
+        env:
+          ADS_ENABLED: ${{ vars.ADS_ENABLED }}
+          ADS_CLIENT: ${{ vars.ADS_CLIENT }}
+          GA_MEASUREMENT_ID: ${{ vars.GA_MEASUREMENT_ID_MAKCHA }}
+
+      - name: Save data
+        uses: actions/cache/save@v4
+        if: always()
+        with:
+          path: sites/makcha/data
+          key: makcha-data-${{ github.run_id }}
+
+      - name: Deploy
+        uses: peaceiris/actions-gh-pages@v4
+        with:
+          deploy_key: ${{ secrets.DEPLOY_KEY_MAKCHA }}
+          external_repository: andonghun/makcha-site
+          publish_branch: gh-pages
+          publish_dir: ./sites/makcha/dist
+          force_orphan: true
+          cname: makcha.factpane.com
+
+      - name: IndexNow
+        if: env.INDEXNOW_KEY != ''
+        run: pnpm indexnow
