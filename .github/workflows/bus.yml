@@ -1,0 +1,102 @@
+name: bus
+
+# 버스편(bus.factpane.com)의 매일 수집·빌드·배포. 공개 저장소 andonghun/bus-runner에서 돈다.
+# 공개 저장소의 Actions는 무료·무제한이라, 하루 210분을 쓰는 버스편 수집을 비공개 sites 저장소의 무료분(월 2,000분)에서 뺐다.
+# 코드는 매 실행마다 비공개 andonghun/sites의 main을 읽기 전용 배포 키로 받아 온다. 이 파일의 원본은 sites의 ops/bus-runner/에 있다.
+
+on:
+  schedule:
+    - cron: '0 18 * * *' # 03:00 KST
+  workflow_dispatch:
+    inputs:
+      budget:
+        description: 'TAGO API당 하루 호출 예산, 고속·시외 각각 (기본 250000, 운영계정 한도 500000)'
+        required: false
+        default: '250000'
+
+concurrency:
+  group: bus
+  cancel-in-progress: false
+
+env:
+  INDEXNOW_KEY: ${{ secrets.INDEXNOW_KEY }}
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    defaults:
+      run:
+        working-directory: sites/bus
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: andonghun/sites
+          ref: main
+          ssh-key: ${{ secrets.SITES_DEPLOY_KEY }}
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+        working-directory: .
+
+      # SQLite와 OSM 결과는 Actions 캐시로 넘긴다. 캐시가 없으면(첫 실행, 7일 미사용) 이 저장소 릴리스 seed의 사본으로 시작한다.
+      - name: Restore data
+        id: restore
+        uses: actions/cache/restore@v4
+        with:
+          path: sites/bus/data
+          key: bus-data-${{ github.run_id }}
+          restore-keys: bus-data-
+
+      - name: Seed data
+        if: steps.restore.outputs.cache-matched-key == ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release download seed -R "$GITHUB_REPOSITORY" -p bus-data.tar.gz -D "$RUNNER_TEMP"
+          tar -xzf "$RUNNER_TEMP/bus-data.tar.gz" -C "$GITHUB_WORKSPACE"
+          ls -la data
+
+      - name: Collect
+        env:
+          TAGO_API_KEY: ${{ secrets.TAGO_API_KEY }}
+          TAGO_DAILY_BUDGET: ${{ github.event.inputs.budget || '250000' }}
+        run: pnpm collect
+
+      # OpenStreetMap: 지하철역(30일마다), 터미널 좌표(새 터미널만, 초당 1건)
+      - name: Places
+        run: pnpm stations && pnpm geocode
+
+      - name: Save data
+        uses: actions/cache/save@v4
+        if: always()
+        with:
+          path: sites/bus/data
+          key: bus-data-${{ github.run_id }}
+
+      - name: Build
+        env:
+          ADS_ENABLED: ${{ vars.ADS_ENABLED }}
+          ADS_CLIENT: ${{ vars.ADS_CLIENT }}
+          ADS_SLOT_SUMMARY: ${{ vars.ADS_SLOT_SUMMARY }}
+          ADS_SLOT_TABLE: ${{ vars.ADS_SLOT_TABLE }}
+          GA_MEASUREMENT_ID: ${{ vars.GA_MEASUREMENT_ID_BUS }}
+        run: pnpm build
+
+      - name: Deploy
+        uses: peaceiris/actions-gh-pages@v4
+        with:
+          deploy_key: ${{ secrets.DEPLOY_KEY_BUS }}
+          external_repository: andonghun/bus-site
+          publish_branch: gh-pages
+          publish_dir: ./sites/bus/dist
+          force_orphan: true
+          cname: bus.factpane.com
+
+      # 키 파일이 배포된 뒤에 알려야 검증이 통과한다. 실패해도 배포는 유지.
+      - name: IndexNow
+        if: env.INDEXNOW_KEY != ''
+        run: pnpm indexnow
